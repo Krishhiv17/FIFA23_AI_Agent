@@ -111,8 +111,8 @@ def train_position_models(test_size: float = 0.2, random_state: int = 42):
     sample_weight = np.array([class_weights[cls] for cls in y_train])
 
     xgb = XGBClassifier(
-        n_estimators=600,        # a bit more trees
-        max_depth=6,            # slightly deeper
+        n_estimators=600,      
+        max_depth=6,           
         learning_rate=0.05,
         subsample=0.8,
         colsample_bytree=0.8,

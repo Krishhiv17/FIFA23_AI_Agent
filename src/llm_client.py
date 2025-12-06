@@ -2,6 +2,7 @@
 
 import os
 import requests
+from requests.exceptions import RequestException
 from typing import List, Dict
 from dotenv import load_dotenv # type: ignore
 
@@ -62,8 +63,14 @@ def call_llama(
         "top_p": top_p,
     }
 
-    response = requests.post(API_URL, headers=HEADERS, json=payload, timeout=60)
-    response.raise_for_status()
+    try:
+        response = requests.post(API_URL, headers=HEADERS, json=payload, timeout=60)
+        response.raise_for_status()
+    except RequestException as exc:
+        raise RuntimeError(
+            "LLM request failed (network/endpoint issue). "
+            "Check internet connectivity and HF_TOKEN."
+        ) from exc
     data = response.json()
 
     # Expected structure:

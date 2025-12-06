@@ -1,4 +1,6 @@
 import json
+import re
+from difflib import SequenceMatcher
 from typing import Dict, Any, List
 from pathlib import Path
 import sys
@@ -142,6 +144,80 @@ Your answer must:
 """.strip()
 
 
+def _fmt_value(eur: float) -> str:
+    """Human-friendly Euro formatting for console output."""
+    try:
+        eur = float(eur)
+    except Exception:
+        return str(eur)
+    if abs(eur) >= 1_000_000:
+        return f"€{eur/1_000_000:.1f}M"
+    if abs(eur) >= 1_000:
+        return f"€{eur/1_000:.1f}K"
+    return f"€{int(eur)}"
+
+
+def offline_fallback(user_query: str, error: Exception) -> str:
+    """
+    Handle LLM failures (no internet / HF router down) by serving a best-effort
+    answer directly from local models.
+    """
+    players = find_players_by_name(user_query)
+    if players.empty:
+        return (
+            "LLM is unreachable right now (likely no internet). "
+            f"Also could not find a local player match for '{user_query}'. "
+            "Please retry when online or use an exact FIFA 23 player name."
+        )
+
+    query_norm = user_query.lower()
+    query_tokens = set(re.findall(r"[a-z]+", query_norm))
+
+    def _score(row) -> float:
+        name = f"{row['short_name']} {row.get('long_name', '')}".lower()
+        base = SequenceMatcher(None, query_norm, name).ratio()
+        name_tokens = set(re.findall(r"[a-z]+", name))
+        overlap = len(query_tokens & name_tokens)
+        return base + 0.2 * overlap
+
+    player_row = max(
+        (row for _, row in players.iterrows()),
+        key=_score,
+    )
+    short_name = str(player_row["short_name"])
+
+    try:
+        result = predict_all_for_player(short_name)
+    except Exception as model_error:
+        return (
+            "LLM is unreachable right now (likely no internet). "
+            f"Found local player '{short_name}' but failed to run models: {model_error}"
+        )
+
+    player = result["player"]
+    actual = result["actual"]
+    preds = result["predictions"]
+
+    top3 = preds["position"].get("position_top3", [])
+    top3_str = ", ".join(
+        [f"{item['position']} ({item['prob']*100:.0f}%)" for item in top3]
+    ) or "n/a"
+
+    return (
+        "LLM is unreachable right now (likely network blocked). "
+        "Showing offline results from local models.\n"
+        f"Player: {player['long_name']} ({player['short_name']}), "
+        f"age {player['age']}, club {player.get('club_name', '') or 'N/A'}, "
+        f"nation {player.get('nationality_name', '') or 'N/A'}.\n"
+        f"Actual dataset: value {_fmt_value(actual['value_eur'])}, "
+        f"overall {actual['overall']}, position {actual['position_10']}.\n"
+        f"Predicted: value {_fmt_value(preds['value']['value_pred'])}, "
+        f"overall {preds['overall']['overall_pred']:.1f}, "
+        f"position {preds['position']['position_pred']} "
+        f"(top3: {top3_str})."
+    )
+
+
 def parse_tool_call(text: str) -> Dict[str, Any]:
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     for line in lines:
@@ -166,7 +242,8 @@ def extract_final_answer(text: str) -> str:
 def run_tool(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     if tool_name == "search_player":
         query = args.get("query", "")
-        df = find_players_by_name(query)
+        # Keep tool outputs tight so the LLM cannot wander to unrelated players.
+        df = find_players_by_name(query, top_k=1)
 
         # Restrict to a clean subset of columns for the LLM
         cols = [
@@ -204,7 +281,10 @@ def agent_chat(user_query: str, max_tool_loops: int = 6) -> str:
 
     for _ in range(max_tool_loops):
         # 1) Ask Llama what to do next
-        assistant_reply = call_llama(messages)
+        try:
+            assistant_reply = call_llama(messages)
+        except Exception as e:
+            return offline_fallback(user_query, e)
         messages.append({"role": "assistant", "content": assistant_reply})
 
         # 2) Check for TOOL call

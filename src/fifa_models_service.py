@@ -31,6 +31,24 @@ _overall_art = None
 _position_art = None
 
 
+def _assert_not_lfs_pointer(path: Path) -> None:
+    """
+    Detect Git LFS pointer files and raise a clear error before joblib.load
+    tries to unpickle garbage text.
+    """
+    if not path.exists():
+        raise FileNotFoundError(f"Required model file missing: {path}")
+
+    with path.open("rb") as f:
+        prefix = f.read(200)
+
+    if b"git-lfs.github.com" in prefix:
+        raise RuntimeError(
+            f"{path} looks like a Git LFS pointer. "
+            "Download the real model files with `git lfs pull`."
+        )
+
+
 def _load_df() -> pd.DataFrame:
     global _df
     if _df is None:
@@ -41,6 +59,7 @@ def _load_df() -> pd.DataFrame:
 def _load_value_model():
     global _value_art
     if _value_art is None:
+        _assert_not_lfs_pointer(MODELS_DIR / "value_xgb.joblib")
         _value_art = joblib.load(MODELS_DIR / "value_xgb.joblib")
     return _value_art
 
@@ -48,6 +67,7 @@ def _load_value_model():
 def _load_overall_model():
     global _overall_art
     if _overall_art is None:
+        _assert_not_lfs_pointer(MODELS_DIR / "overall_xgb.joblib")
         _overall_art = joblib.load(MODELS_DIR / "overall_xgb.joblib")
     return _overall_art
 
@@ -55,6 +75,7 @@ def _load_overall_model():
 def _load_position_model():
     global _position_art
     if _position_art is None:
+        _assert_not_lfs_pointer(MODELS_DIR / "position_xgb.joblib")
         _position_art = joblib.load(MODELS_DIR / "position_xgb.joblib")
     return _position_art
 
@@ -64,8 +85,9 @@ def _load_position_model():
 def _normalize_name(text: str) -> str:
     """Lowercase, remove weird chars, collapse spaces."""
     text = text.lower()
-    # keep letters, spaces, dots
-    text = re.sub(r"[^a-z\s\.]", " ", text)
+    text = text.replace(".", " ")
+    # keep letters and spaces
+    text = re.sub(r"[^a-z\s]", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
@@ -78,6 +100,7 @@ def find_players_by_name(query: str, top_k: int = 5) -> pd.DataFrame:
     """
     df = _load_df()
     q_norm = _normalize_name(query)
+    q_tokens = [t for t in q_norm.split() if t]
 
     # 1) Build a search key per player: "short long"
     name_keys = (
@@ -100,7 +123,23 @@ def find_players_by_name(query: str, top_k: int = 5) -> pd.DataFrame:
         )
         return candidates.head(top_k)
 
-    # 3) Fuzzy match fallback (for typos etc.)
+    # 3) Token-overlap match (handles missing middle names, order differences)
+    if q_tokens:
+        q_token_set = set(q_tokens)
+        token_scores = name_keys_norm.apply(
+            lambda s: len(q_token_set & set(s.split())) / len(q_token_set)
+            if s else 0.0
+        )
+        token_mask = token_scores > 0
+        if token_mask.any():
+            cand = df[token_mask].copy()
+            cand["__score"] = token_scores[token_mask]
+            cand = cand.sort_values(
+                by=["__score", "overall", "value_eur"], ascending=False
+            )
+            return cand.drop(columns="__score").head(top_k)
+
+    # 4) Fuzzy match fallback (for typos etc.)
     # Compute similarity score between query and each name
     scores = []
     for idx, name in enumerate(name_keys_norm):
